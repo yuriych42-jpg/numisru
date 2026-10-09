@@ -1,1 +1,55 @@
 
+name: Build NumisRU APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Extract project
+        run: |
+          set -e
+          ZIP_FILE="numisru_github_no_supabase.zip"
+          test -f "$ZIP_FILE"
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
+          PROJECT_DIR="$(find extracted -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
+          test -n "$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Prepare Android
+        run: |
+          cd "$PROJECT_DIR"
+          if [ ! -f android/gradlew ]; then
+            flutter create --platforms=android --org ru.numisru --project-name numisru --no-pub .
+          fi
+          chmod +x android/gradlew
+
+      - name: Install dependencies
+        run: |
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR"
+          flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NumisRU-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
