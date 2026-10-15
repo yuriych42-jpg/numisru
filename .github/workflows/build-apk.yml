@@ -71,6 +71,18 @@ jobs:
           echo "Flutter project: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
+      - name: Fix Android Gradle compatibility
+        working-directory: ${{ steps.flutter_project.outputs.project_dir }}
+        run: |
+          set -e
+          mkdir -p android
+          touch android/gradle.properties
+          if grep -q '^android.newDsl=' android/gradle.properties; then
+            sed -i 's/^android.newDsl=.*/android.newDsl=false/' android/gradle.properties
+          else
+            echo 'android.newDsl=false' >> android/gradle.properties
+          fi
+
       - name: Install Flutter dependencies
         working-directory: ${{ steps.flutter_project.outputs.project_dir }}
         run: flutter pub get
