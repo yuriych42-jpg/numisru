@@ -19,3 +19,89 @@ jobs:
 
     steps:
       - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Find and extract NumisRU ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
+            -name 'NumisRU_v0.79.3_TEST_austria-load-fix*.zip' \
+            -print -quit)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::NumisRU ZIP was not found in the repository root."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/numisru-source"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/numisru-source"
+
+          PUBSPEC="$(find "$RUNNER_TEMP/numisru-source" \
+            -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' \
+            -print -quit)"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml was not found inside the ZIP."
+            echo "The ZIP may not contain the Flutter project."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+
+          if [ ! -d "$PROJECT_DIR/android" ]; then
+            echo "::error::The Flutter project has no android directory."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project found: $PROJECT_DIR"
+
+      - name: Apply Android Gradle compatibility setting
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLE_PROPERTIES="$PROJECT_DIR/android/gradle.properties"
+          touch "$GRADLE_PROPERTIES"
+
+          if grep -qE '^[[:space:]]*android\.newDsl=' "$GRADLE_PROPERTIES"; then
+            sed -i \
+              's/^[[:space:]]*android\.newDsl=.*/android.newDsl=false/' \
+              "$GRADLE_PROPERTIES"
+          else
+            printf '\nandroid.newDsl=false\n' >> "$GRADLE_PROPERTIES"
+          fi
+
+          echo "Gradle compatibility setting:"
+          grep -n 'android.newDsl' "$GRADLE_PROPERTIES"
+
+      - name: Install Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NumisRU-release-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
