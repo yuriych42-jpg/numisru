@@ -1,19 +1,16 @@
 
-name: Build NumisRU APK
+name: Build NumisRU TEST APK
 
 on:
   workflow_dispatch:
   push:
-    paths:
-      - ".github/workflows/build-apk.yml"
-      - "NumisRU_v0.79.3_TEST_austria-load-fix*.zip"
+    branches: [main, master]
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -21,87 +18,188 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Flutter
+      - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Find and extract NumisRU ZIP
+      - name: Show tool versions
+        run: |
+          set -eux
+          flutter --version
+          java -version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+      - name: Extract NumisRU project
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
-            -name 'NumisRU_v0.79.3_TEST_austria-load-fix*.zip' \
-            -print -quit)"
+          ZIP_FILE="NumisRU_v0.79.3_TEST_austria-load-fix.zip"
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "::error::NumisRU ZIP was not found in the repository root."
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "::error::Archive not found: $ZIP_FILE"
+            echo "ZIP files in repository root:"
+            find . -maxdepth 1 -type f -name '*.zip' -print
             exit 1
           fi
 
-          mkdir -p "$RUNNER_TEMP/numisru-source"
-          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/numisru-source"
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
 
-          PUBSPEC="$(find "$RUNNER_TEMP/numisru-source" \
-            -type f -name pubspec.yaml \
-            -not -path '*/.dart_tool/*' \
-            -print -quit)"
-
+          PUBSPEC="$(find extracted -type f -name pubspec.yaml -print -quit)"
           if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml was not found inside the ZIP."
-            echo "The ZIP may not contain the Flutter project."
+            echo "::error::pubspec.yaml was not found in the archive"
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          if [ ! -d "$PROJECT_DIR/android" ]; then
-            echo "::error::The Flutter project has no android directory."
+          echo "Project directory: $PROJECT_DIR"
+          echo "Project version:"
+          grep -nE '^(name|version|environment):|sdk:' "$PUBSPEC" || true
+
+      - name: Prepare Android Gradle configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          test -f pubspec.yaml
+          test -f android/settings.gradle
+          test -f android/app/build.gradle
+
+          echo "=== Android settings.gradle ==="
+          cat android/settings.gradle
+
+          echo "=== Android app/build.gradle ==="
+          cat android/app/build.gradle
+
+          echo "=== Existing Gradle properties ==="
+          cat android/gradle.properties
+
+          # Keep the project's existing Android configuration.
+          # Disable the AGP 9 new DSL if the installed Flutter plugin
+          # supports this compatibility switch.
+          if ! grep -qE '^[[:space:]]*android\.newDsl[[:space:]]*=' android/gradle.properties; then
+            printf '\nandroid.newDsl=false\n' >> android/gradle.properties
+          else
+            sed -i 's/^[[:space:]]*android\.newDsl[[:space:]]*=.*/android.newDsl=false/' android/gradle.properties
+          fi
+
+          chmod +x android/gradlew 2>/dev/null || true
+
+          echo "=== Effective project Gradle properties ==="
+          cat android/gradle.properties
+
+          echo "=== AGP and Kotlin plugin declarations ==="
+          grep -nE 'com\.android\.application|org\.jetbrains\.kotlin\.android' \
+            android/settings.gradle android/build.gradle android/app/build.gradle \
+            2>/dev/null || true
+
+      - name: Generate Gradle wrapper if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ ! -f android/gradlew ] || \
+             [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            echo "Gradle wrapper is missing; generating Android platform files."
+
+            flutter create \
+              --platforms=android \
+              --org ru.numisru \
+              --project-name numisru \
+              --no-pub .
+
+            # Retain the project's Groovy Gradle files if they exist.
+            rm -f android/settings.gradle.kts
+            rm -f android/build.gradle.kts
+            rm -f android/app/build.gradle.kts
+          fi
+
+          test -f android/gradlew
+          test -f android/gradle/wrapper/gradle-wrapper.properties
+          chmod +x android/gradlew
+
+          echo "=== Gradle wrapper version ==="
+          cat android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Verify Android Gradle Plugin version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          echo "=== Plugin declarations after preparation ==="
+          grep -R -nE \
+            'com\.android\.application.*version|com\.android\.tools\.build:gradle|android\.newDsl' \
+            android --include='*.gradle' --include='*.properties' || true
+
+          # This project is configured for AGP 8.11.1.
+          # Fail explicitly if a different AGP version is declared.
+          if ! grep -Eq \
+            'id "com\.android\.application" version "8\.11\.1"' \
+            android/settings.gradle; then
+            echo "::error::Expected AGP 8.11.1 in android/settings.gradle."
+            echo "Refusing to silently build with a different AGP version."
             exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Flutter project found: $PROJECT_DIR"
-
-      - name: Apply Android Gradle compatibility setting
+      - name: Install Android NDK
         shell: bash
         run: |
           set -euo pipefail
 
-          GRADLE_PROPERTIES="$PROJECT_DIR/android/gradle.properties"
-          touch "$GRADLE_PROPERTIES"
+          NDK_PACKAGE="ndk;28.2.13676358"
+          for attempt in 1 2 3; do
+            echo "Installing $NDK_PACKAGE (attempt $attempt/3)"
+            if yes | sdkmanager --install "$NDK_PACKAGE"; then
+              exit 0
+            fi
 
-          if grep -qE '^[[:space:]]*android\.newDsl=' "$GRADLE_PROPERTIES"; then
-            sed -i \
-              's/^[[:space:]]*android\.newDsl=.*/android.newDsl=false/' \
-              "$GRADLE_PROPERTIES"
-          else
-            printf '\nandroid.newDsl=false\n' >> "$GRADLE_PROPERTIES"
+            rm -rf \
+              "$ANDROID_HOME/ndk/28.2.13676358" \
+              "$ANDROID_HOME/.temp" \
+              "$HOME/.android/cache"
+            sleep 5
+          done
+
+          echo "::error::NDK installation failed after 3 attempts"
+          exit 1
+
+      - name: Resolve Flutter dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          flutter build apk --release -v
+
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error::APK was not produced"
+            exit 1
           fi
 
-          echo "Gradle compatibility setting:"
-          grep -n 'android.newDsl' "$GRADLE_PROPERTIES"
-
-      - name: Install Flutter dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
-
-      - name: Build release APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --release
+          ls -lh "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NumisRU-release-APK
+          name: NumisRU-v0.79.3-TEST-APK
           path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 14
