@@ -1,78 +1,18 @@
 
-name: Build NumisRU APK
+  - name: Find latest versioned ZIP
+    id: archive
+    run: |
+      set -e
+      ZIP_FILE="NumisRU_v0.79.3_TEST_austria-load-fix.zip"
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - "*.zip"
-      - ".github/workflows/build-apk.yml"
+      if [ ! -f "$ZIP_FILE" ]; then
+        ZIP_FILE=$(find . -maxdepth 1 -type f -name 'NumisRU_v0.79.3_TEST_austria-load-fix*.zip' | sort | head -n 1)
+      fi
 
-permissions:
-  contents: read
+      if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
+        echo "Fixed v0.79.3 ZIP not found"
+        exit 1
+      fi
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Find latest versioned ZIP
-        id: archive
-        run: |
-          set -e
-          ZIP_FILE=$(find . -maxdepth 1 -type f -name 'NumisRU_v*_TEST_*.zip' | sort -V | tail -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No versioned NumisRU test ZIP found"
-            exit 1
-          fi
-          echo "Using $ZIP_FILE"
-          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-
-      - name: Extract project
-        run: |
-          set -e
-          mkdir extracted
-          unzip -q "${{ steps.archive.outputs.zip_file }}" -d extracted
-          PROJECT_DIR="$(find extracted -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "pubspec.yaml not found in ZIP"
-            exit 1
-          fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Update Android Gradle Plugin
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-          if [ -f android/settings.gradle ]; then
-            sed -i "s/8\.7\.3/8.11.1/g" android/settings.gradle
-          fi
-          if [ -f android/build.gradle ]; then
-            sed -i "s/8\.7\.3/8.11.1/g" android/build.gradle
-          fi
-
-      - name: Build APK
-        run: |
-          cd "$PROJECT_DIR"
-          flutter pub get
-          flutter build apk --release --android-skip-build-dependency-validation
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: NumisRU-v0.03-TEST-APK
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+      echo "Using $ZIP_FILE"
+      echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
