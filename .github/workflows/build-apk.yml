@@ -42,7 +42,6 @@ jobs:
 
           if [ ! -f "$ZIP_FILE" ]; then
             echo "::error::Archive not found: $ZIP_FILE"
-            echo "ZIP files in repository root:"
             find . -maxdepth 1 -type f -name '*.zip' -print
             exit 1
           fi
@@ -61,7 +60,6 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
           echo "Project directory: $PROJECT_DIR"
-          echo "Project version:"
           grep -nE '^(name|version|environment):|sdk:' "$PUBSPEC" || true
 
       - name: Prepare Android Gradle configuration
@@ -73,28 +71,14 @@ jobs:
           test -f pubspec.yaml
 
           if [ ! -f android/settings.gradle ] && [ ! -f android/settings.gradle.kts ]; then
-            echo "::error::Android settings.gradle was not found"
+            echo "::error::Android settings file is missing"
             exit 1
           fi
 
           if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
-            echo "::error::Android app/build.gradle was not found"
+            echo "::error::Android app Gradle file is missing"
             exit 1
           fi
-
-          echo "=== Android settings.gradle ==="
-          for f in android/settings.gradle android/settings.gradle.kts; do
-            if [ -f "$f" ]; then
-              cat "$f"
-            fi
-          done
-
-          echo "=== Android app/build.gradle ==="
-          for f in android/app/build.gradle android/app/build.gradle.kts; do
-            if [ -f "$f" ]; then
-              cat "$f"
-            fi
-          done
 
           mkdir -p android
 
@@ -110,7 +94,17 @@ jobs:
 
           chmod +x android/gradlew 2>/dev/null || true
 
-          echo "=== Effective Gradle properties ==="
+          echo "=== Android settings ==="
+          for f in android/settings.gradle android/settings.gradle.kts; do
+            if [ -f "$f" ]; then cat "$f"; fi
+          done
+
+          echo "=== Android app Gradle configuration ==="
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$f" ]; then cat "$f"; fi
+          done
+
+          echo "=== Gradle properties ==="
           cat android/gradle.properties
 
       - name: Generate Gradle wrapper if missing
@@ -121,7 +115,7 @@ jobs:
 
           if [ ! -f android/gradlew ] || \
              [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
-            echo "Gradle wrapper is missing; generating Android platform files."
+            echo "Gradle wrapper is missing; generating Android files."
 
             flutter create \
               --platforms=android \
@@ -138,7 +132,6 @@ jobs:
           test -f android/gradle/wrapper/gradle-wrapper.properties
           chmod +x android/gradlew
 
-          echo "=== Gradle wrapper version ==="
           cat android/gradle/wrapper/gradle-wrapper.properties
 
       - name: Upgrade Kotlin version
@@ -152,7 +145,7 @@ jobs:
           import re
           import sys
 
-          roots = [
+          files = [
               Path("android/settings.gradle"),
               Path("android/settings.gradle.kts"),
               Path("android/build.gradle"),
@@ -161,75 +154,90 @@ jobs:
               Path("android/app/build.gradle.kts"),
           ]
 
-          changed_files = []
-          found_declaration = False
+          changed = []
 
-          for path in roots:
+          for path in files:
               if not path.exists():
                   continue
 
               original = path.read_text()
-              lines = original.splitlines(keepends=True)
-              updated_lines = []
+              updated = original
 
-              for line in lines:
-                  new_line = line
+              updated = re.sub(
+                  r'((?:id\s*\(?\s*["\']org\.jetbrains\.kotlin\.android["\']|kotlin\(["\']android["\']\))\s*(?:version\s*)?["\']?)'
+                  r'([0-9]+\.[0-9]+\.[0-9]+)',
+                  lambda m: m.group(1) + "2.2.20",
+                  updated,
+              )
 
-                  is_kotlin_plugin = (
-                      "org.jetbrains.kotlin.android" in line
-                      or "kotlin-android" in line
-                  )
+              updated = re.sub(
+                  r'(ext\.kotlin_version\s*=\s*["\'])[0-9]+\.[0-9]+\.[0-9]+(["\'])',
+                  r'\g<1>2.2.20\2',
+                  updated,
+              )
 
-                  is_kotlin_version_assignment = (
-                      "kotlin_version" in line
-                      or "kotlinVersion" in line
-                  )
-
-                  if is_kotlin_plugin and re.search(r"\bversion\b", line):
-                      found_declaration = True
-                      new_line = re.sub(
-                          r'(\bversion\s*["\']?)[0-9]+\.[0-9]+\.[0-9]+(["\']?)',
-                          r'\g<1>2.2.20\2',
-                          line,
-                      )
-
-                  elif is_kotlin_version_assignment:
-                      found_declaration = True
-                      new_line = re.sub(
-                          r'((?:kotlin_version|kotlinVersion)\s*=\s*["\'])[0-9]+\.[0-9]+\.[0-9]+(["\'])',
-                          r'\g<1>2.2.20\2',
-                          line,
-                      )
-
-                  updated_lines.append(new_line)
-
-              updated = "".join(updated_lines)
+              updated = re.sub(
+                  r'((?:kotlinVersion|kotlin_version)\s*=\s*["\'])[0-9]+\.[0-9]+\.[0-9]+(["\'])',
+                  r'\g<1>2.2.20\2',
+                  updated,
+              )
 
               if updated != original:
                   path.write_text(updated)
-                  changed_files.append(str(path))
+                  changed.append(str(path))
 
-          if not found_declaration or not changed_files:
-              print(
-                  "::error::Could not automatically update the Kotlin "
-                  "version declaration to 2.2.20."
-              )
-              print("Gradle configuration files for diagnosis:")
-              for path in roots:
-                  if path.exists():
-                      print(f"\n--- {path} ---")
-                      print(path.read_text())
+          print("Kotlin declaration files changed:", changed)
+
+          all_text = "\n".join(
+              p.read_text()
+              for p in files
+              if p.exists()
+          )
+
+          if "2.2.20" not in all_text:
+              print("::error::Kotlin version 2.2.20 was not found after update.")
+              for p in files:
+                  if p.exists():
+                      print(f"\n--- {p} ---\n{p.read_text()}")
               sys.exit(1)
-
-          print("Kotlin version updated to 2.2.20 in:")
-          for path in changed_files:
-              print(f" - {path}")
           PY
 
-          echo "=== Kotlin plugin declarations after update ==="
+          echo "=== Kotlin declarations ==="
           grep -R -nE \
             'org\.jetbrains\.kotlin\.android|kotlin-android|kotlin_version|kotlinVersion' \
             android --include='*.gradle' --include='*.gradle.kts' || true
+
+      - name: Fix duplicate launcher icon resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          RES_DIR="android/app/src/main/res"
+
+          if [ ! -d "$RES_DIR" ]; then
+            echo "::error::Android resources directory not found: $RES_DIR"
+            exit 1
+          fi
+
+          echo "Checking launcher icon resource conflicts..."
+
+          while IFS= read -r -d '' xml_file; do
+            dir="$(dirname "$xml_file")"
+            png_file="$dir/ic_launcher.png"
+
+            if [ -f "$png_file" ]; then
+              echo "Removing duplicate XML resource: $xml_file"
+              rm -f "$xml_file"
+            fi
+          done < <(
+            find "$RES_DIR" -type f -name 'ic_launcher.xml' -print0
+          )
+
+          echo "=== Remaining launcher icon resources ==="
+          find "$RES_DIR" -type f \
+            \( -name 'ic_launcher.png' -o -name 'ic_launcher.xml' \) \
+            -print
 
       - name: Verify Android Gradle Plugin version
         shell: bash
@@ -242,20 +250,10 @@ jobs:
             'com\.android\.application.*version|com\.android\.tools\.build:gradle|android\.newDsl' \
             android --include='*.gradle' --include='*.gradle.kts' --include='*.properties' || true
 
-          if [ -f android/settings.gradle ]; then
-            SETTINGS="android/settings.gradle"
-          elif [ -f android/settings.gradle.kts ]; then
-            SETTINGS="android/settings.gradle.kts"
-          else
-            echo "::error::Android settings file is missing"
-            exit 1
-          fi
-
           if ! grep -Eq \
             'com\.android\.application.*version.*8\.11\.1|com\.android\.tools\.build:gradle:8\.11\.1' \
-            "$SETTINGS" android/build.gradle android/build.gradle.kts 2>/dev/null; then
+            android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts 2>/dev/null; then
             echo "::error::Expected Android Gradle Plugin 8.11.1 was not found."
-            echo "Check the Gradle plugin version before building."
             exit 1
           fi
 
@@ -281,8 +279,7 @@ jobs:
 
           if [ -z "$SDKMANAGER" ]; then
             echo "::error::sdkmanager not found"
-            find "$SDK_ROOT" -maxdepth 6 \
-              -type f -name sdkmanager -print || true
+            find "$SDK_ROOT" -maxdepth 6 -type f -name sdkmanager -print || true
             exit 1
           fi
 
@@ -326,6 +323,7 @@ jobs:
           flutter build apk --release -v
 
           APK="build/app/outputs/flutter-apk/app-release.apk"
+
           if [ ! -f "$APK" ]; then
             echo "::error::APK was not produced"
             exit 1
