@@ -8,8 +8,8 @@ on:
       - main
       - master
     paths:
-      - '*.zip'
-      - '.github/workflows/build-apk.yml'
+      - "*.zip"
+      - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
@@ -22,36 +22,105 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select source ZIP and extract project
+      - name: Find and extract source ZIP
         id: source
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' \
-            | grep -Ei 'numisru.*(code|version_sync)' \
-            | sort -V \
-            | tail -n 1 || true)"
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' | sort -V | tail -n 1)"
 
-          if [ -n "$ZIP_FILE" ]; then
-            echo "Using source archive: $ZIP_FILE"
-            mkdir -p "$RUNNER_TEMP/numisru-source"
-            unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/numisru-source"
-
-            PROJECT_DIR="$(find "$RUNNER_TEMP/numisru-source" \
-              -name pubspec.yaml -type f -print -quit \
-              | xargs -r dirname)"
-
-            if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/pubspec.yaml" ]; then
-              echo "::error::Could not find pubspec.yaml in the ZIP archive."
-              exit 1
-            fi
-          elif [ -f pubspec.yaml ]; then
-            echo "No matching ZIP found; using repository project."
-            PROJECT_DIR="$GITHUB_WORKSPACE"
-          else
-            echo "::error::No matching NumisRU ZIP and no root pubspec.yaml found."
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP archive found in repository root."
             exit 1
           fi
 
-          VERSION="$(python3 - "$PROJECT_DIR/pubspec.yaml" <<'
+          echo "Using source archive: $ZIP_FILE"
+
+          mkdir -p source
+          unzip -q "$ZIP_FILE" -d source
+
+          PROJECT_DIR="$(find source -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            echo "ERROR: pubspec.yaml was not found inside the ZIP."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+          VERSION="$(sed -n 's/^version:[[:space:]]*//p' "$PROJECT_DIR/pubspec.yaml" | head -n 1 | tr -d '\r')"
+
+          if [ -z "$VERSION" ]; then
+            VERSION="0.0.0+0"
+          fi
+
+          APP_VERSION="${VERSION%%+*}"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "Project directory: $PROJECT_DIR"
+          echo "App version: $APP_VERSION"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Fix Dart imports and version constant
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          main_file = project / "lib" / "main.dart"
+
+          if not main_file.exists():
+              print("No lib/main.dart found; skipping import fix.")
+              raise SystemExit(0)
+
+          source = main_file.read_text(encoding="utf-8")
+          declaration = re.compile(
+              r"(?m)^const\s+String\s+appVersion\s*=\s*"
+              r"String\.fromEnvironment\([^\n]*\);\s*\n?"
+          )
+
+          match = declaration.search(source)
+          if match:
+              version_line = match.group(0).strip()
+              source = source[:match.start()] + source[match.end():]
+              lines = source.splitlines(keepends=True)
+
+              insert_at = 0
+              for i, line in enumerate(lines):
+                  stripped = line.strip()
+                  if (
+                      stripped.startswith("import ")
+                      or stripped.startswith("export ")
+                      or stripped.startswith("part ")
+                  ):
+                      insert_at = i + 1
+                  elif stripped and not stripped.startswith("//"):
+                      if insert_at == 0:
+                          insert_at = i
+                      break
+
+              lines.insert(insert_at, version_line + "\n")
+              source = "".join(lines)
+              main_file.write_text(source, encoding="utf-8")
+              print("Moved appVersion declaration after Dart directives.")
+          else:
+              print("No appVersion declaration requiring
