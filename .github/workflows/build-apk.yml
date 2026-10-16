@@ -1,3 +1,4 @@
+
 name: Build NumisRU APK
 
 on:
@@ -63,7 +64,7 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Project directory: $PROJECT_DIR"
 
-      - name: Fix app version and Android Gradle configuration
+      - name: Fix Dart and Android build configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -76,6 +77,7 @@ jobs:
 
           root = pathlib.Path(os.environ["PROJECT_DIR"])
 
+          # Read application version from pubspec.yaml.
           pubspec = root / "pubspec.yaml"
           pubspec_text = pubspec.read_text(encoding="utf-8")
 
@@ -90,10 +92,17 @@ jobs:
           full_version = match.group(1)
           app_version = full_version.split("+", 1)[0]
 
-          if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", app_version):
+          if not re.fullmatch(
+              r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?",
+              app_version
+          ):
               sys.exit(f"ERROR: Unexpected app version: {app_version}")
 
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+          with open(
+              os.environ["GITHUB_ENV"],
+              "a",
+              encoding="utf-8"
+          ) as env:
               env.write(f"APP_VERSION={app_version}\n")
 
           print(f"App version: {app_version}")
@@ -102,50 +111,92 @@ jobs:
           # Keep appVersion after all Dart directives.
           main_dart = root / "lib" / "main.dart"
 
-          if main_dart.exists():
-              source = main_dart.read_text(encoding="utf-8")
-              lines = source.splitlines()
+          if not main_dart.exists():
+              sys.exit("ERROR: lib/main.dart was not found.")
 
-              lines = [
-                  line for line in lines
-                  if not re.match(
-                      r"^\s*(?:const\s+)?String\s+appVersion\s*=",
-                      line
+          source = main_dart.read_text(encoding="utf-8")
+          lines = source.splitlines()
+
+          # Remove previous generated declarations to avoid duplicates.
+          lines = [
+              line for line in lines
+              if not re.match(
+                  r"^\s*(?:const\s+)?String\s+appVersion\s*=",
+                  line
+              )
+          ]
+
+          last_directive = -1
+
+          for index, line in enumerate(lines):
+              if re.match(
+                  r"^\s*(import|export|part)\s",
+                  line
+              ):
+                  last_directive = index
+
+          declaration = (
+              f"const String appVersion = "
+              f"String.fromEnvironment("
+              f"'APP_VERSION', defaultValue: '{app_version}');"
+          )
+
+          lines.insert(last_directive + 1, declaration)
+
+          source = "\n".join(lines) + "\n"
+
+          # Add the missing query field used by the country search UI.
+          class_match = re.search(
+              r"class\s+_CountryListPageState\s+extends\s+State<[^>]+>\s*\{",
+              source
+          )
+
+          if class_match:
+              class_start = class_match.end()
+
+              next_class = re.search(
+                  r"(?m)^class\s+",
+                  source[class_start:]
+              )
+
+              class_end = (
+                  class_start + next_class.start()
+                  if next_class else len(source)
+              )
+
+              class_body = source[class_start:class_end]
+
+              has_query_field = re.search(
+                  r"(?m)^\s*(?:late\s+)?(?:String|var)\s+query\s*=",
+                  class_body
+              )
+
+              if not has_query_field:
+                  source = (
+                      source[:class_start]
+                      + "\n  String query = '';\n"
+                      + source[class_start:]
                   )
-              ]
-
-              last_directive = -1
-
-              for index, line in enumerate(lines):
-                  if re.match(
-                      r"^\s*(import|export|part)\s",
-                      line
-                  ):
-                      last_directive = index
-
-              declaration = (
-                  f"const String appVersion = "
-                  f"String.fromEnvironment("
-                  f"'APP_VERSION', defaultValue: '{app_version}');"
-              )
-
-              lines.insert(last_directive + 1, declaration)
-
-              main_dart.write_text(
-                  "\n".join(lines) + "\n",
-                  encoding="utf-8"
-              )
-
-              print("Updated lib/main.dart appVersion declaration.")
+                  print(
+                      "Added missing query field to "
+                      "_CountryListPageState."
+                  )
+              else:
+                  print("Country search query field already exists.")
           else:
-              print("WARNING: lib/main.dart not found; skipping appVersion patch.")
+              sys.exit(
+                  "ERROR: _CountryListPageState was not found in main.dart."
+              )
 
+          main_dart.write_text(source, encoding="utf-8")
+          print("Updated lib/main.dart.")
+
+          # Configure Android build tools.
           android = root / "android"
 
           if not android.exists():
               sys.exit("ERROR: Android directory not found.")
 
-          # Patch Android Gradle Plugin and Kotlin plugin versions.
           gradle_files = [
               android / "settings.gradle",
               android / "settings.gradle.kts",
@@ -160,20 +211,21 @@ jobs:
               if not path.exists():
                   continue
 
-              text = path.read_text(encoding="utf-8")
-              original = text
-
+              original = path.read_text(encoding="utf-8")
               updated_lines = []
 
-              for line in text.splitlines():
-                  if "com.android.application" in line or \
-                     "com.android.library" in line:
-                      if "version" in line:
-                          line = re.sub(
-                              r'(version\s+)(["\'])[^"\']+\2',
-                              r'\g<1>"8.11.1"',
-                              line
-                          )
+              for line in original.splitlines():
+
+                  # Android Gradle Plugin.
+                  if (
+                      "com.android.application" in line
+                      or "com.android.library" in line
+                  ) and "version" in line:
+                      line = re.sub(
+                          r'(version\s+)(["\'])[^"\']+\2',
+                          r'\g<1>"8.11.1"',
+                          line
+                      )
 
                   if "com.android.tools.build:gradle:" in line:
                       line = re.sub(
@@ -182,31 +234,38 @@ jobs:
                           line
                       )
 
-                  if "org.jetbrains.kotlin.android" in line or \
-                     "kotlin-android" in line or \
-                     "org.jetbrains.kotlin.jvm" in line:
-                      if "version" in line:
-                          line = re.sub(
-                              r'(version\s+)(["\'])[^"\']+\2',
-                              r'\g<1>"2.2.20"',
-                              line
-                          )
+                  # Kotlin Gradle plugin.
+                  if (
+                      "org.jetbrains.kotlin.android" in line
+                      or "kotlin-android" in line
+                      or "org.jetbrains.kotlin.jvm" in line
+                  ) and "version" in line:
+                      line = re.sub(
+                          r'(version\s+)(["\'])[^"\']+\2',
+                          r'\g<1>"2.2.20"',
+                          line
+                      )
 
-                  if "kotlin_version" in line or "kotlinVersion" in line:
+                  if (
+                      "kotlin_version" in line
+                      or "kotlinVersion" in line
+                  ):
                       line = re.sub(
                           r'(["\'])1\.[^"\']+\1',
                           '"2.2.20"',
                           line
                       )
 
+                  # Gradle version catalog.
                   if path.name == "libs.versions.toml":
-                      if re.match(r'\s*agp\s*=', line):
+                      if re.match(r"\s*agp\s*=", line):
                           line = re.sub(
                               r'=\s*["\'][^"\']+["\']',
                               '= "8.11.1"',
                               line
                           )
-                      if re.match(r'\s*kotlin\s*=', line):
+
+                      if re.match(r"\s*kotlin\s*=", line):
                           line = re.sub(
                               r'=\s*["\'][^"\']+["\']',
                               '= "2.2.20"',
@@ -217,8 +276,11 @@ jobs:
 
               updated = "\n".join(updated_lines) + "\n"
 
-              # Also support old projects using ext.kotlin_version.
-              if path.name == "build.gradle" and path.parent == android:
+              # Support projects using ext.kotlin_version.
+              if (
+                  path.name == "build.gradle"
+                  and path.parent == android
+              ):
                   updated = re.sub(
                       r"(ext\.kotlin_version\s*=\s*['\"])[^'\"]+(['\"])",
                       r"\g<1>2.2.20\2",
@@ -229,29 +291,35 @@ jobs:
                   path.write_text(updated, encoding="utf-8")
                   print(f"Patched: {path.relative_to(root)}")
 
-          # AGP 8.11.1 requires a compatible Gradle wrapper.
-          wrapper = android / "gradle" / "wrapper" / "gradle-wrapper.properties"
+          # Use a compatible Gradle wrapper.
+          wrapper = (
+              android
+              / "gradle"
+              / "wrapper"
+              / "gradle-wrapper.properties"
+          )
 
           if wrapper.exists():
-              text = wrapper.read_text(encoding="utf-8")
-              text = re.sub(
-                  r"distributionUrl=.*",
+              wrapper_text = wrapper.read_text(encoding="utf-8")
+
+              wrapper_text = re.sub(
+                  r"(?m)^distributionUrl=.*$",
                   "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-bin.zip",
-                  text
+                  wrapper_text
               )
-              wrapper.write_text(text, encoding="utf-8")
+
+              wrapper.write_text(wrapper_text, encoding="utf-8")
               print("Set Gradle wrapper to 8.13.")
 
-          # Flutter uses build.gradle when both app Gradle files exist.
-          # Remove the ignored Kotlin DSL duplicate to avoid ambiguity.
+          # Remove duplicate Kotlin DSL app config when Groovy config exists.
           groovy_app = android / "app" / "build.gradle"
           kotlin_app = android / "app" / "build.gradle.kts"
 
           if groovy_app.exists() and kotlin_app.exists():
               kotlin_app.unlink()
-              print("Removed ignored duplicate android/app/build.gradle.kts.")
+              print("Removed duplicate android/app/build.gradle.kts.")
 
-          print("Gradle compatibility patch completed.")
+          print("Build configuration patch completed.")
           PY
 
       - name: Get Flutter dependencies
@@ -262,6 +330,7 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
+
           flutter build apk --release \
             --dart-define="APP_VERSION=${APP_VERSION}"
 
