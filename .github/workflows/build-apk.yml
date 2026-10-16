@@ -1,10 +1,16 @@
 
-name: Build NumisRU TEST APK
+name: Build Android APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
+    paths:
+      - '*.zip'
+      - '**/*.zip'
+      - '.github/workflows/build-apk.yml'
 
 permissions:
   contents: read
@@ -12,368 +18,98 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Flutter
+      - name: Find newest version ZIP
+        id: archive
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import re
+          import sys
+
+          archives = glob.glob("*.zip")
+          candidates = []
+
+          for archive in archives:
+              # Ищем версию вида 0.84.3 в любом имени ZIP.
+              match = re.search(
+                  r'(?i)(?:^|[^a-z0-9])v?(\d+(?:\.\d+)+)',
+                  os.path.basename(archive)
+              )
+              if not match:
+                  print(f"Skipping ZIP without version: {archive}")
+                  continue
+
+              version = tuple(int(part) for part in match.group(1).split("."))
+              candidates.append((version, archive))
+
+          if not candidates:
+              print("ERROR: No root ZIP with a dotted version was found.")
+              sys.exit(1)
+
+          candidates.sort(key=lambda item: (item[0], item[1]))
+          version, archive = candidates[-1]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"zip_path={archive}\n")
+              output.write(
+                  "app_version=" + ".".join(map(str, version)) + "\n"
+              )
+
+          print(f"Selected ZIP: {archive}")
+          print(f"Detected version: {'.'.join(map(str, version))}")
+          PY
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Show tool versions
+      - name: Extract project ZIP
         shell: bash
         run: |
-          set -eux
-          flutter --version
-          java -version
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          mkdir -p project
+          unzip -q "${{ steps.archive.outputs.zip_path }}" -d project
 
-      - name: Extract NumisRU project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          
-          # Автоматически выбираем ZIP с самой высокой версией.
-          # Если версия одинаковая, предпочитаем архив с суффиксом _fixed.
-          ZIP_FILE="$(python3 - <<'PYZIP'
-          from pathlib import Path
-          import re
-
-          candidates = []
-
-          for p in Path('.').glob('NumisRU_v*_CODE*.zip'):
-              match = re.fullmatch(
-                  r'NumisRU_v(\d+(?:\.\d+)*)_CODE(.*)\.zip',
-                  p.name
-              )
-              if not match:
-                  continue
-
-              version = tuple(
-                  int(part) for part in match.group(1).split('.')
-              )
-              fixed = 1 if 'fixed' in match.group(2).lower() else 0
-              candidates.append((version, fixed, p.name))
-
-          if not candidates:
-              raise SystemExit(
-                  'ERROR: No NumisRU_v*_CODE*.zip found in repository root'
-              )
-
-          candidates.sort()
-          print(candidates[-1][2])
-          PYZIP
-          )"
-
-          echo "Selected archive: $ZIP_FILE"
-          sha256sum "$ZIP_FILE"
-
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q "$ZIP_FILE" -d extracted
-
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "::error::Archive not found: $ZIP_FILE"
-            find . -maxdepth 1 -type f -name '*.zip' -print
-            exit 1
-          fi
-
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q "$ZIP_FILE" -d extracted
-
-          PUBSPEC="$(find extracted -type f -name pubspec.yaml -print -quit)"
+          # Если ZIP содержит папку проекта внутри, находим pubspec.yaml.
+          PUBSPEC=$(find project -name pubspec.yaml -type f -print -quit)
           if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml was not found in the archive"
+            echo "ERROR: pubspec.yaml not found in ZIP"
             exit 1
           fi
 
-          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          PROJECT_DIR=$(dirname "$PUBSPEC")
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project: $PROJECT_DIR"
 
-          echo "Project directory: $PROJECT_DIR"
-          grep -nE '^(name|version|environment):|sdk:' "$PUBSPEC" || true
+      - name: Get Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
 
-      - name: Prepare Android Gradle configuration
-        shell: bash
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          test -f pubspec.yaml
-
-          if [ ! -f android/settings.gradle ] && [ ! -f android/settings.gradle.kts ]; then
-            echo "::error::Android settings file is missing"
-            exit 1
-          fi
-
-          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
-            echo "::error::Android app Gradle file is missing"
-            exit 1
-          fi
-
-          mkdir -p android
-
-          if [ ! -f android/gradle.properties ]; then
-            touch android/gradle.properties
-          fi
-
-          if ! grep -qE '^[[:space:]]*android\.newDsl[[:space:]]*=' android/gradle.properties; then
-            printf '\nandroid.newDsl=false\n' >> android/gradle.properties
-          else
-            sed -i 's/^[[:space:]]*android\.newDsl[[:space:]]*=.*/android.newDsl=false/' android/gradle.properties
-          fi
-
-          chmod +x android/gradlew 2>/dev/null || true
-
-          echo "=== Android settings ==="
-          for f in android/settings.gradle android/settings.gradle.kts; do
-            if [ -f "$f" ]; then cat "$f"; fi
-          done
-
-          echo "=== Android app Gradle configuration ==="
-          for f in android/app/build.gradle android/app/build.gradle.kts; do
-            if [ -f "$f" ]; then cat "$f"; fi
-          done
-
-          echo "=== Gradle properties ==="
-          cat android/gradle.properties
-
-      - name: Generate Gradle wrapper if missing
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          if [ ! -f android/gradlew ] || \
-             [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
-            echo "Gradle wrapper is missing; generating Android files."
-
-            flutter create \
-              --platforms=android \
-              --org ru.numisru \
-              --project-name numisru \
-              --no-pub .
-
-            rm -f android/settings.gradle.kts
-            rm -f android/build.gradle.kts
-            rm -f android/app/build.gradle.kts
-          fi
-
-          test -f android/gradlew
-          test -f android/gradle/wrapper/gradle-wrapper.properties
-          chmod +x android/gradlew
-
-          cat android/gradle/wrapper/gradle-wrapper.properties
-
-      - name: Upgrade Kotlin version
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-
-          files = [
-              Path("android/settings.gradle"),
-              Path("android/settings.gradle.kts"),
-              Path("android/build.gradle"),
-              Path("android/build.gradle.kts"),
-              Path("android/app/build.gradle"),
-              Path("android/app/build.gradle.kts"),
-          ]
-
-          changed = []
-
-          for path in files:
-              if not path.exists():
-                  continue
-
-              original = path.read_text()
-              updated = original
-
-              updated = re.sub(
-                  r'((?:id\s*\(?\s*["\']org\.jetbrains\.kotlin\.android["\']|kotlin\(["\']android["\']\))\s*(?:version\s*)?["\']?)'
-                  r'([0-9]+\.[0-9]+\.[0-9]+)',
-                  lambda m: m.group(1) + "2.2.20",
-                  updated,
-              )
-
-              updated = re.sub(
-                  r'(ext\.kotlin_version\s*=\s*["\'])[0-9]+\.[0-9]+\.[0-9]+(["\'])',
-                  r'\g<1>2.2.20\2',
-                  updated,
-              )
-
-              updated = re.sub(
-                  r'((?:kotlinVersion|kotlin_version)\s*=\s*["\'])[0-9]+\.[0-9]+\.[0-9]+(["\'])',
-                  r'\g<1>2.2.20\2',
-                  updated,
-              )
-
-              if updated != original:
-                  path.write_text(updated)
-                  changed.append(str(path))
-
-          print("Kotlin declaration files changed:", changed)
-
-          all_text = "\n".join(
-              p.read_text()
-              for p in files
-              if p.exists()
-          )
-
-          if "2.2.20" not in all_text:
-              print("::error::Kotlin version 2.2.20 was not found after update.")
-              for p in files:
-                  if p.exists():
-                      print(f"\n--- {p} ---\n{p.read_text()}")
-              sys.exit(1)
-          PY
-
-          echo "=== Kotlin declarations ==="
-          grep -R -nE \
-            'org\.jetbrains\.kotlin\.android|kotlin-android|kotlin_version|kotlinVersion' \
-            android --include='*.gradle' --include='*.gradle.kts' || true
-
-      - name: Fix duplicate launcher icon resources
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          RES_DIR="android/app/src/main/res"
-
-          if [ ! -d "$RES_DIR" ]; then
-            echo "::error::Android resources directory not found: $RES_DIR"
-            exit 1
-          fi
-
-          echo "Checking launcher icon resource conflicts..."
-
-          while IFS= read -r -d '' xml_file; do
-            dir="$(dirname "$xml_file")"
-            png_file="$dir/ic_launcher.png"
-
-            if [ -f "$png_file" ]; then
-              echo "Removing duplicate XML resource: $xml_file"
-              rm -f "$xml_file"
-            fi
-          done < <(
-            find "$RES_DIR" -type f -name 'ic_launcher.xml' -print0
-          )
-
-          echo "=== Remaining launcher icon resources ==="
-          find "$RES_DIR" -type f \
-            \( -name 'ic_launcher.png' -o -name 'ic_launcher.xml' \) \
-            -print
-
-      - name: Verify Android Gradle Plugin version
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          echo "=== Android Gradle Plugin declarations ==="
-          grep -R -nE \
-            'com\.android\.application.*version|com\.android\.tools\.build:gradle|android\.newDsl' \
-            android --include='*.gradle' --include='*.gradle.kts' --include='*.properties' || true
-
-          if ! grep -Eq \
-            'com\.android\.application.*version.*8\.11\.1|com\.android\.tools\.build:gradle:8\.11\.1' \
-            android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts 2>/dev/null; then
-            echo "::error::Expected Android Gradle Plugin 8.11.1 was not found."
-            exit 1
-          fi
-
-      - name: Install Android NDK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          SDKMANAGER="$(command -v sdkmanager || true)"
-
-          if [ -z "$SDKMANAGER" ]; then
-            for candidate in \
-              "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-              "$SDK_ROOT/cmdline-tools/bin/sdkmanager" \
-              "$SDK_ROOT/tools/bin/sdkmanager"; do
-              if [ -x "$candidate" ]; then
-                SDKMANAGER="$candidate"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager not found"
-            find "$SDK_ROOT" -maxdepth 6 -type f -name sdkmanager -print || true
-            exit 1
-          fi
-
-          echo "Using sdkmanager: $SDKMANAGER"
-          "$SDKMANAGER" --version
-
-          NDK_PACKAGE="ndk;28.2.13676358"
-
-          for attempt in 1 2 3; do
-            echo "Installing $NDK_PACKAGE (attempt $attempt/3)"
-
-            if { yes || true; } | "$SDKMANAGER" \
-              --sdk_root="$SDK_ROOT" --install "$NDK_PACKAGE"; then
-              exit 0
-            fi
-
-            rm -rf \
-              "$SDK_ROOT/ndk/28.2.13676358" \
-              "$SDK_ROOT/.temp" \
-              "$HOME/.android/cache"
-
-            sleep 5
-          done
-
-          echo "::error::NDK installation failed after 3 attempts"
-          exit 1
-
-      - name: Resolve Flutter dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          flutter pub get
-
-      - name: Build APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          flutter build apk --release -v
-
-          APK="build/app/outputs/flutter-apk/app-release.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "::error::APK was not produced"
-            exit 1
-          fi
-
-          echo "=== APK file ==="
-          ls -lh "$APK"
+          flutter build apk --release \
+            --dart-define=APP_VERSION=${{ steps.archive.outputs.app_version }} \
+            -v
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NumisRU-v0.79.3-TEST-APK
+          name: NumisRU-${{ steps.archive.outputs.app_version }}-APK
           path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
