@@ -22,45 +22,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find and extract source ZIP
-        id: source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' | sort -V | tail -n 1)"
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP archive found in repository root."
-            exit 1
-          fi
-
-          echo "Using source archive: $ZIP_FILE"
-
-          mkdir -p source
-          unzip -q "$ZIP_FILE" -d source
-
-          PROJECT_DIR="$(find source -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
-
-          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/pubspec.yaml" ]; then
-            echo "ERROR: pubspec.yaml was not found inside the ZIP."
-            exit 1
-          fi
-
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-
-          VERSION="$(sed -n 's/^version:[[:space:]]*//p' "$PROJECT_DIR/pubspec.yaml" | head -n 1 | tr -d '\r')"
-
-          if [ -z "$VERSION" ]; then
-            VERSION="0.0.0+0"
-          fi
-
-          APP_VERSION="${VERSION%%+*}"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-
-          echo "Project directory: $PROJECT_DIR"
-          echo "App version: $APP_VERSION"
-
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -73,54 +34,139 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Fix Dart imports and version constant
+      - name: Find and extract project ZIP
+        id: source
         shell: bash
-        env:
-          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
         run: |
           set -euo pipefail
+
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' -print | sort -V | tail -n 1)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP archive found in repository root."
+            exit 1
+          fi
+
+          echo "Using source archive: $ZIP_FILE"
+          mkdir -p source
+          unzip -q "$ZIP_FILE" -d source
+
+          PUBSPEC="$(find source -type f -name pubspec.yaml -print -quit)"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "ERROR: pubspec.yaml not found inside ZIP."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          VERSION="$(sed -n 's/^version:[[:space:]]*//p' "$PUBSPEC" | head -n 1)"
+          APP_VERSION="${VERSION%%+*}"
+
+          if [ -z "$APP_VERSION" ]; then
+            APP_VERSION="0.0.0"
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Project directory: $PROJECT_DIR"
+          echo "App version: $APP_VERSION"
+
+      - name: Fix appVersion declaration
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f lib/main.dart ]; then
+            echo "ERROR: lib/main.dart not found."
+            exit 1
+          fi
+
+          export APP_VERSION="${{ steps.source.outputs.app_version }}"
 
           python3 - <<'PY'
           import os
           import re
           from pathlib import Path
 
-          project = Path(os.environ["PROJECT_DIR"])
-          main_file = project / "lib" / "main.dart"
+          path = Path("lib/main.dart")
+          source = path.read_text(encoding="utf-8")
 
-          if not main_file.exists():
-              print("No lib/main.dart found; skipping import fix.")
-              raise SystemExit(0)
-
-          source = main_file.read_text(encoding="utf-8")
-          declaration = re.compile(
-              r"(?m)^const\s+String\s+appVersion\s*=\s*"
-              r"String\.fromEnvironment\([^\n]*\);\s*\n?"
+          declaration = (
+              "const String appVersion = "
+              "String.fromEnvironment('APP_VERSION', "
+              "defaultValue: '" + os.environ["APP_VERSION"] + "');"
           )
 
-          match = declaration.search(source)
-          if match:
-              version_line = match.group(0).strip()
-              source = source[:match.start()] + source[match.end():]
-              lines = source.splitlines(keepends=True)
+          pattern = re.compile(
+              r"(?m)^[ \t]*const[ \t]+String[ \t]+appVersion[ \t]*=.*?;[ \t]*\n?"
+          )
 
-              insert_at = 0
-              for i, line in enumerate(lines):
-                  stripped = line.strip()
-                  if (
-                      stripped.startswith("import ")
-                      or stripped.startswith("export ")
-                      or stripped.startswith("part ")
-                  ):
-                      insert_at = i + 1
-                  elif stripped and not stripped.startswith("//"):
-                      if insert_at == 0:
-                          insert_at = i
-                      break
+          source = pattern.sub("", source)
 
-              lines.insert(insert_at, version_line + "\n")
-              source = "".join(lines)
-              main_file.write_text(source, encoding="utf-8")
-              print("Moved appVersion declaration after Dart directives.")
-          else:
-              print("No appVersion declaration requiring
+          lines = source.splitlines(keepends=True)
+          insert_at = 0
+
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+
+              if (
+                  stripped.startswith("import ")
+                  or stripped.startswith("export ")
+                  or stripped.startswith("part ")
+              ):
+                  insert_at = index + 1
+              elif stripped and not stripped.startswith("//"):
+                  if insert_at == 0:
+                      insert_at = index
+                  break
+
+          lines.insert(insert_at, declaration + "\n")
+          path.write_text("".join(lines), encoding="utf-8")
+          print("Updated appVersion declaration in lib/main.dart")
+          PY
+
+      - name: Prepare Android project
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f android/gradlew ]; then
+            flutter create --platforms=android .
+          fi
+
+          if [ -f android/gradle.properties ]; then
+            grep -q '^android.useAndroidX=true$' android/gradle.properties || \
+              echo 'android.useAndroidX=true' >> android/gradle.properties
+            grep -q '^android.enableJetifier=true$' android/gradle.properties || \
+              echo 'android.enableJetifier=true' >> android/gradle.properties
+          else
+            printf '%s\n' \
+              'android.useAndroidX=true' \
+              'android.enableJetifier=true' > android/gradle.properties
+          fi
+
+      - name: Install Flutter dependencies
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build release APK
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        env:
+          APP_VERSION: ${{ steps.source.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          flutter build apk --release --dart-define="APP_VERSION=$APP_VERSION"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NumisRU-v${{ steps.source.outputs.app_version }}-TEST-APK
+          path: ${{ steps.source.outputs.project_dir }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
