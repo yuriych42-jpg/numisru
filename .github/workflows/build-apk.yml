@@ -1,14 +1,9 @@
-
 name: Build NumisRU APK
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
     paths:
-      - "*.zip"
       - ".github/workflows/build-apk.yml"
 
 permissions:
@@ -16,6 +11,7 @@ permissions:
 
 jobs:
   build:
+    name: Build release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -34,189 +30,245 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Find and extract project ZIP
-        id: source
+      - name: Find and extract ZIP archive
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' -print | sort -V | tail -n 1)"
+          mapfile -t ZIP_FILES < <(
+            find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort -V
+          )
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP archive found in repository root."
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "::error::No ZIP archive found in repository root."
             exit 1
           fi
 
+          ZIP_FILE="${ZIP_FILES[${#ZIP_FILES[@]}-1]}"
           echo "Using source archive: $ZIP_FILE"
-          mkdir -p source
-          unzip -q "$ZIP_FILE" -d source
 
-          PUBSPEC="$(find source -type f -name pubspec.yaml -print -quit)"
+          mkdir -p source
+          unzip -oq "$ZIP_FILE" -d source
+
+          PUBSPEC="$(find source -name pubspec.yaml -type f -print -quit)"
 
           if [ -z "$PUBSPEC" ]; then
-            echo "ERROR: pubspec.yaml not found inside ZIP."
+            echo "::error::pubspec.yaml was not found in the ZIP archive."
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$PUBSPEC")"
-          VERSION="$(sed -n 's/^version:[[:space:]]*//p' "$PUBSPEC" | head -n 1)"
-          APP_VERSION="${VERSION%%+*}"
+          PROJECT_DIR="$(realpath "$PROJECT_DIR")"
 
-          if [ -z "$APP_VERSION" ]; then
-            APP_VERSION="0.0.0"
-          fi
-
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Project directory: $PROJECT_DIR"
-          echo "App version: $APP_VERSION"
 
-      - name: Fix appVersion declaration
+      - name: Fix app version and Android Gradle configuration
         shell: bash
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        env:
-          APP_VERSION: ${{ steps.source.outputs.app_version }}
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
+          import pathlib
+          import re
           import os
-          import re
-          from pathlib import Path
+          import sys
 
-          path = Path("lib/main.dart")
+          root = pathlib.Path(os.environ["PROJECT_DIR"])
 
-          if not path.exists():
-              raise SystemExit("ERROR: lib/main.dart not found.")
+          pubspec = root / "pubspec.yaml"
+          pubspec_text = pubspec.read_text(encoding="utf-8")
 
-          source = path.read_text(encoding="utf-8")
-
-          declaration = (
-              "const String appVersion = "
-              "String.fromEnvironment('APP_VERSION', "
-              "defaultValue: '" + os.environ["APP_VERSION"] + "');"
+          match = re.search(
+              r"(?m)^version:\s*([^\s#]+)",
+              pubspec_text
           )
 
-          pattern = re.compile(
-              r"(?m)^[ \t]*const[ \t]+String[ \t]+appVersion[ \t]*=.*?;[ \t]*\n?"
-          )
+          if not match:
+              sys.exit("ERROR: version: was not found in pubspec.yaml")
 
-          source = pattern.sub("", source)
-          lines = source.splitlines(keepends=True)
-          insert_at = 0
+          full_version = match.group(1)
+          app_version = full_version.split("+", 1)[0]
 
-          for index, line in enumerate(lines):
-              stripped = line.strip()
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", app_version):
+              sys.exit(f"ERROR: Unexpected app version: {app_version}")
 
-              if (
-                  stripped.startswith("import ")
-                  or stripped.startswith("export ")
-                  or stripped.startswith("part ")
-              ):
-                  insert_at = index + 1
-              elif stripped and not stripped.startswith("//"):
-                  if insert_at == 0:
-                      insert_at = index
-                  break
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"APP_VERSION={app_version}\n")
 
-          lines.insert(insert_at, declaration + "\n")
-          path.write_text("".join(lines), encoding="utf-8")
+          print(f"App version: {app_version}")
+          print(f"Pubspec version: {full_version}")
 
-          print("Updated appVersion declaration.")
-          PY
+          # Keep appVersion after all Dart directives.
+          main_dart = root / "lib" / "main.dart"
 
-      - name: Prepare Android project
-        shell: bash
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        run: |
-          set -euo pipefail
+          if main_dart.exists():
+              source = main_dart.read_text(encoding="utf-8")
+              lines = source.splitlines()
 
-          if [ ! -f android/gradlew ]; then
-            flutter create --platforms=android .
-          fi
+              lines = [
+                  line for line in lines
+                  if not re.match(
+                      r"^\s*(?:const\s+)?String\s+appVersion\s*=",
+                      line
+                  )
+              ]
 
-          mkdir -p android
+              last_directive = -1
 
-          touch android/gradle.properties
+              for index, line in enumerate(lines):
+                  if re.match(
+                      r"^\s*(import|export|part)\s",
+                      line
+                  ):
+                      last_directive = index
 
-          for setting in \
-            "android.useAndroidX=true" \
-            "android.enableJetifier=true" \
-            "android.newDsl=false"
-          do
-            key="${setting%%=*}"
-            if grep -qE "^[[:space:]]*${key}=" android/gradle.properties; then
-              sed -i "s|^[[:space:]]*${key}=.*|${setting}|" android/gradle.properties
-            else
-              echo "$setting" >> android/gradle.properties
-            fi
-          done
+              declaration = (
+                  f"const String appVersion = "
+                  f"String.fromEnvironment("
+                  f"'APP_VERSION', defaultValue: '{app_version}');"
+              )
 
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
+              lines.insert(last_directive + 1, declaration)
 
-          settings_files = [
-              Path("android/settings.gradle"),
-              Path("android/settings.gradle.kts"),
+              main_dart.write_text(
+                  "\n".join(lines) + "\n",
+                  encoding="utf-8"
+              )
+
+              print("Updated lib/main.dart appVersion declaration.")
+          else:
+              print("WARNING: lib/main.dart not found; skipping appVersion patch.")
+
+          android = root / "android"
+
+          if not android.exists():
+              sys.exit("ERROR: Android directory not found.")
+
+          # Patch Android Gradle Plugin and Kotlin plugin versions.
+          gradle_files = [
+              android / "settings.gradle",
+              android / "settings.gradle.kts",
+              android / "build.gradle",
+              android / "build.gradle.kts",
+              android / "app" / "build.gradle",
+              android / "app" / "build.gradle.kts",
+              android / "gradle" / "libs.versions.toml",
           ]
 
-          found = False
-
-          for path in settings_files:
+          for path in gradle_files:
               if not path.exists():
                   continue
 
               text = path.read_text(encoding="utf-8")
+              original = text
 
-              text, agp_count = re.subn(
-                  r"""(?m)(id\s*\(?\s*["']com\.android\.(?:application|library)["']\s*\)?\s+version\s+["'])[^"']+(["'])""",
-                  r"\g<1>8.9.1\g<2>",
-                  text,
-              )
+              updated_lines = []
 
-              text, kotlin_count = re.subn(
-                  r"""(?m)(id\s*\(?\s*["']org\.jetbrains\.kotlin(?:\.android|\.jvm)?["']\s*\)?\s+version\s+["'])[^"']+(["'])""",
-                  r"\g<1>2.2.20\g<2>",
-                  text,
-              )
+              for line in text.splitlines():
+                  if "com.android.application" in line or \
+                     "com.android.library" in line:
+                      if "version" in line:
+                          line = re.sub(
+                              r'(version\s+)(["\'])[^"\']+\2',
+                              r'\g<1>"8.11.1"',
+                              line
+                          )
 
-              if agp_count or kotlin_count:
-                  path.write_text(text, encoding="utf-8")
-                  print(
-                      f"Updated {path}: "
-                      f"AGP changes={agp_count}, Kotlin changes={kotlin_count}"
+                  if "com.android.tools.build:gradle:" in line:
+                      line = re.sub(
+                          r"(com\.android\.tools\.build:gradle:)[^'\"]+",
+                          r"\g<1>8.11.1",
+                          line
+                      )
+
+                  if "org.jetbrains.kotlin.android" in line or \
+                     "kotlin-android" in line or \
+                     "org.jetbrains.kotlin.jvm" in line:
+                      if "version" in line:
+                          line = re.sub(
+                              r'(version\s+)(["\'])[^"\']+\2',
+                              r'\g<1>"2.2.20"',
+                              line
+                          )
+
+                  if "kotlin_version" in line or "kotlinVersion" in line:
+                      line = re.sub(
+                          r'(["\'])1\.[^"\']+\1',
+                          '"2.2.20"',
+                          line
+                      )
+
+                  if path.name == "libs.versions.toml":
+                      if re.match(r'\s*agp\s*=', line):
+                          line = re.sub(
+                              r'=\s*["\'][^"\']+["\']',
+                              '= "8.11.1"',
+                              line
+                          )
+                      if re.match(r'\s*kotlin\s*=', line):
+                          line = re.sub(
+                              r'=\s*["\'][^"\']+["\']',
+                              '= "2.2.20"',
+                              line
+                          )
+
+                  updated_lines.append(line)
+
+              updated = "\n".join(updated_lines) + "\n"
+
+              # Also support old projects using ext.kotlin_version.
+              if path.name == "build.gradle" and path.parent == android:
+                  updated = re.sub(
+                      r"(ext\.kotlin_version\s*=\s*['\"])[^'\"]+(['\"])",
+                      r"\g<1>2.2.20\2",
+                      updated
                   )
-                  found = True
 
-          if not found:
-              print(
-                  "No matching plugin versions changed. "
-                  "Will inspect the Gradle configuration during the build."
+              if updated != original:
+                  path.write_text(updated, encoding="utf-8")
+                  print(f"Patched: {path.relative_to(root)}")
+
+          # AGP 8.11.1 requires a compatible Gradle wrapper.
+          wrapper = android / "gradle" / "wrapper" / "gradle-wrapper.properties"
+
+          if wrapper.exists():
+              text = wrapper.read_text(encoding="utf-8")
+              text = re.sub(
+                  r"distributionUrl=.*",
+                  "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-bin.zip",
+                  text
               )
+              wrapper.write_text(text, encoding="utf-8")
+              print("Set Gradle wrapper to 8.13.")
+
+          # Flutter uses build.gradle when both app Gradle files exist.
+          # Remove the ignored Kotlin DSL duplicate to avoid ambiguity.
+          groovy_app = android / "app" / "build.gradle"
+          kotlin_app = android / "app" / "build.gradle.kts"
+
+          if groovy_app.exists() and kotlin_app.exists():
+              kotlin_app.unlink()
+              print("Removed ignored duplicate android/app/build.gradle.kts.")
+
+          print("Gradle compatibility patch completed.")
           PY
 
-      - name: Install Flutter dependencies
-        shell: bash
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-          flutter pub get
+      - name: Get Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
 
       - name: Build release APK
-        shell: bash
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        env:
-          APP_VERSION: ${{ steps.source.outputs.app_version }}
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
-          flutter build apk --release --dart-define="APP_VERSION=$APP_VERSION"
+          flutter build apk --release \
+            --dart-define="APP_VERSION=${APP_VERSION}"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NumisRU-v${{ steps.source.outputs.app_version }}-TEST-APK
-          path: ${{ steps.source.outputs.project_dir }}/build/app/outputs/flutter-apk/app-release.apk
+          name: NumisRU-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 14
