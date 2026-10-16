@@ -38,7 +38,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          ZIP_FILE="NumisRU_v0.82_CODE_fixed.zip"
+          
+          # Автоматически выбираем ZIP с самой высокой версией.
+          # Если версия одинаковая, предпочитаем архив с суффиксом _fixed.
+          ZIP_FILE="$(python3 - <<'PYZIP'
+          from pathlib import Path
+          import re
+
+          candidates = []
+
+          for p in Path('.').glob('NumisRU_v*_CODE*.zip'):
+              match = re.fullmatch(
+                  r'NumisRU_v(\d+(?:\.\d+)*)_CODE(.*)\.zip',
+                  p.name
+              )
+              if not match:
+                  continue
+
+              version = tuple(
+                  int(part) for part in match.group(1).split('.')
+              )
+              fixed = 1 if 'fixed' in match.group(2).lower() else 0
+              candidates.append((version, fixed, p.name))
+
+          if not candidates:
+              raise SystemExit(
+                  'ERROR: No NumisRU_v*_CODE*.zip found in repository root'
+              )
+
+          candidates.sort()
+          print(candidates[-1][2])
+          PYZIP
+          )"
+
+          echo "Selected archive: $ZIP_FILE"
+          sha256sum "$ZIP_FILE"
+
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
 
           if [ ! -f "$ZIP_FILE" ]; then
             echo "::error::Archive not found: $ZIP_FILE"
