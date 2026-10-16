@@ -1,5 +1,5 @@
 
-name: Build Android APK
+name: Build NumisRU APK
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ on:
       - main
       - master
     paths:
-      - '*.zip'
-      - '**/*.zip'
-      - '.github/workflows/build-apk.yml'
+      - "*.zip"
+      - "**/*.zip"
+      - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
@@ -19,58 +19,64 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      PROJECT_DIR: project
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find newest version ZIP
+      - name: Select newest ZIP archive
         id: archive
         shell: bash
         run: |
           python3 - <<'PY'
-          import glob
-          import os
+          from pathlib import Path
           import re
+          import os
           import sys
 
-          archives = glob.glob("*.zip")
-          candidates = []
+          archives = list(Path(".").glob("*.zip"))
 
-          for archive in archives:
-              # Ищем версию вида 0.84.3 в любом имени ZIP.
+          if not archives:
+              sys.exit("ERROR: No ZIP archives found in repository root.")
+
+          def version_key(path):
               match = re.search(
-                  r'(?i)(?:^|[^a-z0-9])v?(\d+(?:\.\d+)+)',
-                  os.path.basename(archive)
+                  r"(?i)(?:^|[^a-z0-9])v?(\d+(?:\.\d+)+)",
+                  path.stem
               )
               if not match:
-                  print(f"Skipping ZIP without version: {archive}")
-                  continue
+                  return None
 
-              version = tuple(int(part) for part in match.group(1).split("."))
-              candidates.append((version, archive))
+              return tuple(int(x) for x in match.group(1).split("."))
+
+          candidates = [
+              (version_key(path), path)
+              for path in archives
+              if version_key(path) is not None
+          ]
 
           if not candidates:
-              print("ERROR: No root ZIP with a dotted version was found.")
-              sys.exit(1)
+              sys.exit("ERROR: No ZIP archive with a version number found.")
 
-          candidates.sort(key=lambda item: (item[0], item[1]))
-          version, archive = candidates[-1]
+          candidates.sort(key=lambda item: (item[0], item[1].name))
+          version, selected = candidates[-1]
+          app_version = ".".join(str(x) for x in version)
+
+          print(f"Selected archive: {selected}")
+          print(f"App version: {app_version}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"zip_path={archive}\n")
-              output.write(
-                  "app_version=" + ".".join(map(str, version)) + "\n"
-              )
-
-          print(f"Selected ZIP: {archive}")
-          print(f"Detected version: {'.'.join(map(str, version))}")
+              output.write(f"zip_path={selected.resolve()}\n")
+              output.write(f"app_version={app_version}\n")
           PY
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -81,19 +87,79 @@ jobs:
       - name: Extract project ZIP
         shell: bash
         run: |
-          mkdir -p project
-          unzip -q "${{ steps.archive.outputs.zip_path }}" -d project
+          mkdir -p "$PROJECT_DIR"
+          unzip -q "${{ steps.archive.outputs.zip_path }}" -d "$PROJECT_DIR"
 
-          # Если ZIP содержит папку проекта внутри, находим pubspec.yaml.
-          PUBSPEC=$(find project -name pubspec.yaml -type f -print -quit)
+          PUBSPEC=$(find "$PROJECT_DIR" -type f -name pubspec.yaml -print -quit)
+
           if [ -z "$PUBSPEC" ]; then
-            echo "ERROR: pubspec.yaml not found in ZIP"
+            echo "ERROR: pubspec.yaml was not found inside the ZIP."
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$PUBSPEC")
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Flutter project: $PROJECT_DIR"
+          PROJECT_ROOT="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "Flutter project: $PROJECT_ROOT"
+          echo "App version: ${{ steps.archive.outputs.app_version }}"
+
+      - name: Fix Kotlin version for Flutter
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          files = [
+              Path("android/settings.gradle"),
+              Path("android/settings.gradle.kts"),
+              Path("android/build.gradle"),
+              Path("android/build.gradle.kts"),
+          ]
+
+          updated_any = False
+
+          patterns = [
+              (
+                  r"""(?m)(id\s+["']org\.jetbrains\.kotlin\.android["']\s+version\s+["'])[^"']+(["'])""",
+                  r"\g<1>2.2.20\2",
+              ),
+              (
+                  r"""(?m)(id\s*\(\s*["']org\.jetbrains\.kotlin\.android["']\s*\)\s*version\s*\(?\s*["'])[^"']+(["'])""",
+                  r"\g<1>2.2.20\2",
+              ),
+              (
+                  r"""(?mi)(ext\.kotlin_version\s*=\s*["'])[^"']+(["'])""",
+                  r"\g<1>2.2.20\2",
+              ),
+              (
+                  r"""(?mi)(kotlinVersion\s*=\s*["'])[^"']+(["'])""",
+                  r"\g<1>2.2.20\2",
+              ),
+          ]
+
+          for path in files:
+              if not path.exists():
+                  continue
+
+              original = path.read_text(encoding="utf-8")
+              updated = original
+
+              for pattern, replacement in patterns:
+                  updated = re.sub(pattern, replacement, updated)
+
+              if updated != original:
+                  path.write_text(updated, encoding="utf-8")
+                  print(f"Updated Kotlin version in {path}")
+                  updated_any = True
+
+          if not updated_any:
+              print(
+                  "WARNING: Kotlin version declaration was not changed. "
+                  "The build log may show where the version is configured."
+              )
+          PY
 
       - name: Get Flutter dependencies
         working-directory: ${{ env.PROJECT_DIR }}
@@ -102,7 +168,8 @@ jobs:
       - name: Build release APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          flutter build apk --release \
+          flutter build apk \
+            --release \
             --dart-define=APP_VERSION=${{ steps.archive.outputs.app_version }} \
             -v
 
